@@ -1,0 +1,11 @@
+[package]
+name = "memory-estimator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+regex = "1.11.3"
+wasmprinter = "0.239"
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["full"] }
