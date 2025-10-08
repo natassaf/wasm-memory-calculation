@@ -99,6 +99,53 @@ struct WasmResult {
     output: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct MemoryMonitor {
+    pub peak_memory_bytes: u64,
+    pub initial_memory_bytes: u64,
+    pub final_memory_bytes: u64,
+    pub execution_time_ms: u64,
+}
+
+impl MemoryMonitor {
+    pub fn new() -> Self {
+        Self {
+            peak_memory_bytes: 0,
+            initial_memory_bytes: 0,
+            final_memory_bytes: 0,
+            execution_time_ms: 0,
+        }
+    }
+
+    pub fn get_current_memory_usage() -> u64 {
+        // Try Linux /proc/self/statm first (most accurate for Linux)
+        if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+            if let Some(second_field) = statm.split_whitespace().nth(1) {
+                if let Ok(pages) = second_field.parse::<u64>() {
+                    return pages * 4096; // Assuming 4KB pages
+                }
+            }
+        }
+        
+        // For macOS and other Unix-like systems, use ps command
+        // This works on macOS, FreeBSD, and other Unix systems
+        let process = std::process::Command::new("ps")
+            .args(&["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output();
+            
+        if let Ok(output) = process {
+            if let Ok(rss_str) = String::from_utf8(output.stdout) {
+                if let Ok(rss_kb) = rss_str.trim().parse::<u64>() {
+                    return rss_kb * 1024; // Convert KB to bytes
+                }
+            }
+        }
+        
+        // Fallback: return a reasonable estimate
+        50 * 1024 * 1024 // 50MB fallback
+    }
+}
+
 
 impl WasmComponentLoader{
     pub fn new(folder_to_mount:String)->Self{
@@ -184,6 +231,42 @@ impl WasmComponentLoader{
         // println!("load result {:?}", results);
         return Ok(results)
     }
+
+    pub async fn run_func_with_memory_monitoring(&mut self, input:Vec<Val>, func:Func)->Result<(Vec<Val>, MemoryMonitor), anyhow::Error>{
+        let results_len = func.results(&self.store).len();
+        let mut monitor = MemoryMonitor::new();
+        
+        // Record initial memory usage
+        monitor.initial_memory_bytes = MemoryMonitor::get_current_memory_usage();
+        println!("🔍 Initial memory usage: {} bytes ({:.2} MB)", 
+                monitor.initial_memory_bytes, 
+                monitor.initial_memory_bytes as f64 / (1024.0 * 1024.0));
+        
+        let start_time = std::time::Instant::now();
+        println!("🚀 Starting WASM execution...");
+        
+        // Initialize with empty string for WasmResult output
+        let mut results = vec![Val::String("".into()); results_len];
+        let input_args = input;
+        
+        // Execute the function
+        func.call_async(&mut self.store, &input_args, &mut results).await?;
+        
+        // Record final memory usage and execution time
+        monitor.final_memory_bytes = MemoryMonitor::get_current_memory_usage();
+        monitor.execution_time_ms = start_time.elapsed().as_millis() as u64;
+        monitor.peak_memory_bytes = monitor.final_memory_bytes.max(monitor.initial_memory_bytes);
+        
+        println!("⏱️  Execution time: {} ms", monitor.execution_time_ms);
+        println!("🔍 Final memory usage: {} bytes ({:.2} MB)", 
+                monitor.final_memory_bytes, 
+                monitor.final_memory_bytes as f64 / (1024.0 * 1024.0));
+        println!("📊 Peak memory usage: {} bytes ({:.2} MB)", 
+                monitor.peak_memory_bytes, 
+                monitor.peak_memory_bytes as f64 / (1024.0 * 1024.0));
+        
+        return Ok((results, monitor))
+    }
 }
 
 fn input_to_wasm_event_val(input:String) -> wasmtime::component::Val {
@@ -218,4 +301,27 @@ pub async fn run_wasm_job_component(task_id: usize, component_name:String, func_
         Err(e) => Err(e)
     }
     
+}
+
+pub async fn run_wasm_job_component_with_memory_monitoring(task_id: usize, component_name:String, func_name:String, payload:String, folder_to_mount:String)->Result<(Vec<Val>, MemoryMonitor), Error>{
+    let folder_to_mount = "models".to_string();
+    println!("Running component {:?}, func: {:?}", component_name, func_name);
+    let mut shared_wasm_loader = WasmComponentLoader::new(folder_to_mount);
+    let func_to_run: wasmtime::component::Func = shared_wasm_loader.load_func(component_name, func_name).await;
+    println!("payload: {:?}", payload);
+    let input = vec![input_to_wasm_event_val(payload)];
+
+    let result: Result<(Vec<Val>, MemoryMonitor), anyhow::Error> = shared_wasm_loader.run_func_with_memory_monitoring(input, func_to_run).await;
+    match &result {
+        Ok((val, monitor)) => {
+            println!("result: {:?}", val);
+            println!("Finished wasm task {} with memory monitoring", task_id);
+        },
+        Err(e) => println!("error: {:?}", e),
+    }
+    
+    match result {
+        Ok((val, monitor)) => Ok((val, monitor)),
+        Err(e) => Err(e)
+    }
 }

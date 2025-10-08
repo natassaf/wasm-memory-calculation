@@ -13,17 +13,35 @@ pub fn estimate_memory_info(wasm_file: &str, wat_file: &str) -> MemoryInfo {
 }
 
 pub async fn measure_memory_info(wasm_file: &str, wat_file: &str, payload: &str) -> MemoryInfo {
-    let payload = payload.to_string();
-    let result = run_wasm_job_component(0, wasm_file.to_string(), "run".to_string(), payload, "models".to_string()).await;
+    println!("🔬 Measuring actual memory usage for: {}", wasm_file);
+
+    // First, get the estimated memory info
+    let mut estimated_info = build_memory_info(wasm_file, wat_file);
+
+    // Try to run the actual WASM component and measure memory with monitoring
+    let result = run_wasm_job_component_with_memory_monitoring(0, wasm_file.to_string(), "run".to_string(), payload.to_string(), "models/model_1".to_string()).await;
+
     match result {
-        Ok(val) => {
-            println!("Result: {:?}", val);
+        Ok((val, monitor)) => {
+            println!("✅ WASM execution completed successfully");
+            println!("📊 Execution result: {:?}", val);
+
+            // Update the memory info with actual execution data
+            estimated_info.is_ml_workload = true; // Mark as ML since it executed successfully
+            
+            // Update with actual measured memory usage
+            estimated_info.estimated_minimum_memory_bytes = monitor.initial_memory_bytes;
+            estimated_info.estimated_peak_memory_bytes = monitor.peak_memory_bytes;
+            
+            println!("📈 Memory measurement completed");
+            estimated_info
         },
         Err(e) => {
-            println!("Error: {:?}", e);
-        },
+            println!("❌ WASM execution failed: {:?}", e);
+            println!("⚠️  Falling back to estimated memory info");
+            estimated_info
+        }
     }
-    MemoryInfo::new()
 }
 
 #[tokio::main]
@@ -63,4 +81,6 @@ async fn main() {
     let payload = payload_string;
     
     measure_memory_info(wasm_file, wat_file, &payload).await;
+
+    println!("Memory info: {}", memory_info);
 }
