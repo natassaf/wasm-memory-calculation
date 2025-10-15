@@ -1,11 +1,11 @@
 [package]
 name = "memory-estimator"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 regex = "1.11.3"
-wasmprinter = "0.239"
+wasmprinter = "0.240"
 base64 = "0.22"
 flate2 = "1.0"
 serde_json = "1.0"
@@ -15,3 +15,5 @@ wasmtime-wasi = { git = "https://github.com/natassaf/wasmtime.git", package = "w
 wasmtime-wasi-nn = { git = "https://github.com/natassaf/wasmtime.git", package = "wasmtime-wasi-nn", branch = "release-35-update-ort-version", features = ["onnx"] }
 anyhow = "1.0.98"
 serde = "1.0.219"
+sysinfo = "0.37.2"
+actix-web = "4.11.0"

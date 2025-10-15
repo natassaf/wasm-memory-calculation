@@ -4,7 +4,7 @@ use regex::Regex;
 use std::fmt;
 
 #[derive(Debug, Clone)]
-pub struct MemoryInfo {
+pub struct MemoryInfoEstimator {
     pub linear_memory_pages: u32,
     pub linear_memory_bytes: u64,
     pub stack_pointer_offset: u64,
@@ -13,10 +13,12 @@ pub struct MemoryInfo {
     pub estimated_minimum_memory_bytes: u64,
     pub estimated_peak_memory_bytes: u64,
     pub is_ml_workload: bool,
+    pub is_matrix_workload: bool,
+    pub is_simple_workload: bool,
     pub binary_size_bytes: u64,
     pub binary_size_mb: f64,
 }
-impl MemoryInfo {
+impl MemoryInfoEstimator {
 
     pub fn new() -> Self {
         Self {
@@ -28,16 +30,17 @@ impl MemoryInfo {
             estimated_minimum_memory_bytes: 0,
             estimated_peak_memory_bytes: 0,
             is_ml_workload: false,
+            is_matrix_workload: false,
+            is_simple_workload: false,
             binary_size_bytes: 0,
             binary_size_mb: 0.0,
         }
     }
-
     
 }
 
 
-impl fmt::Display for MemoryInfo {
+impl fmt::Display for MemoryInfoEstimator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -68,7 +71,7 @@ impl fmt::Display for MemoryInfo {
 
 
 /// Analyze binary size of WASM file
-pub fn analyze_binary_size(wasm_path: &str, memory_info: &mut MemoryInfo) -> Result<(), Box<dyn std::error::Error>> {
+pub fn analyze_binary_size(wasm_path: &str, memory_info: &mut MemoryInfoEstimator) -> Result<(), Box<dyn std::error::Error>> {
     let metadata = fs::metadata(wasm_path)?;
     let binary_size_bytes = metadata.len();
     let binary_size_mb = binary_size_bytes as f64 / (1024.0 * 1024.0);
@@ -98,14 +101,17 @@ pub fn convert_wasm_to_wat(wasm_path: &str, wat_path: &str) -> Result<(), Box<dy
     Ok(())
 }
 
-/// Analyze memory requirements from a .wat file (SIMPLIFIED)
-pub fn analyze_wat_memory_simple(wat_path: &str, memory_info: &mut MemoryInfo) -> Result<(), Box<dyn std::error::Error>> {
+/// Analyze memory requirements from a .wat file (ENHANCED)
+pub fn analyze_wat_memory_simple(wat_path: &str, memory_info: &mut MemoryInfoEstimator) -> Result<(), Box<dyn std::error::Error>> {
     let content = fs::read_to_string(wat_path)?;
     
-    // Simplified regex patterns for key metrics
+    // Enhanced regex patterns for comprehensive analysis
     let memory_regex = Regex::new(r"\(memory.*?(\d+)\)")?;
-    let stack_regex = Regex::new(r"stack_pointer.*?(\d+)")?;
+    let stack_regex = Regex::new(r"stack_pointer.*?i32\.const\s+(\d+)")?;
     let table_regex = Regex::new(r"\(table.*?(\d+).*?(\d+).*?funcref\)")?;
+    let func_regex = Regex::new(r"^\s*\(func ")?;
+    let data_regex = Regex::new(r"^\s*\(data ")?;
+    let global_regex = Regex::new(r"^\s*\(global ")?;
     
     // Find memory pages
     if let Some(caps) = memory_regex.captures(&content) {
@@ -113,7 +119,7 @@ pub fn analyze_wat_memory_simple(wat_path: &str, memory_info: &mut MemoryInfo) -
         memory_info.linear_memory_bytes = memory_info.linear_memory_pages as u64 * 65536;
     }
     
-    // Find stack pointer
+    // Find stack pointer offset (more precise pattern)
     if let Some(caps) = stack_regex.captures(&content) {
         memory_info.stack_pointer_offset = caps[1].parse()?;
     }
@@ -126,32 +132,119 @@ pub fn analyze_wat_memory_simple(wat_path: &str, memory_info: &mut MemoryInfo) -
     
     memory_info.total_function_references = memory_info.function_tables.iter().sum();
     
+    // Count functions for complexity analysis (simpler approach)
+    let function_count = content.lines()
+        .filter(|line| line.trim().starts_with("(func "))
+        .count();
+    
+    // Count data sections for static data analysis
+    let data_section_count = content.lines()
+        .filter(|line| line.trim().starts_with("(data "))
+        .count();
+    
+    // Count globals for state analysis
+    let global_count = content.lines()
+        .filter(|line| line.trim().starts_with("(global "))
+        .count();
+    
+    // Enhanced workload classification based on multiple factors
+    // ML inference workloads are specifically neural network models (ONNX, etc.)
+    // These typically have moderate size but high function count and data sections
+    let is_ml_inference = memory_info.binary_size_bytes > 600_000 || 
+                         (function_count > 500 && data_section_count > 2) ||
+                         (memory_info.binary_size_bytes > 300_000 && function_count > 400) ||
+                         (memory_info.binary_size_bytes > 200_000 && function_count > 500);
+    
+    // Matrix operations are computational workloads with moderate complexity
+    let is_matrix_workload = memory_info.binary_size_bytes > 150_000 && 
+                            memory_info.binary_size_bytes <= 600_000 &&
+                            function_count > 200 && function_count <= 500 &&
+                            !is_ml_inference;
+    
+    // Simple computational workloads (Fibonacci, basic algorithms)
+    let is_simple_workload = memory_info.binary_size_bytes <= 150_000 || 
+                            function_count <= 200;
+    
+    // Update workload classification flags
+    memory_info.is_ml_workload = is_ml_inference;
+    memory_info.is_matrix_workload = is_matrix_workload;
+    memory_info.is_simple_workload = is_simple_workload;
+    
+    println!("📊 Enhanced WAT Analysis:");
+    println!("   • Functions: {}", function_count);
+    println!("   • Data sections: {}", data_section_count);
+    println!("   • Globals: {}", global_count);
+    println!("   • Stack pointer: {} bytes ({:.2} MB)", 
+             memory_info.stack_pointer_offset,
+             memory_info.stack_pointer_offset as f64 / (1024.0 * 1024.0));
+    
+    // Print workload classification
+    let workload_type = if memory_info.is_ml_workload {
+        "ML Inference"
+    } else if memory_info.is_matrix_workload {
+        "Matrix Operations"
+    } else if memory_info.is_simple_workload {
+        "Simple Computation"
+    } else {
+        "Unclassified"
+    };
+    println!("   • Workload type: {}", workload_type);
+    
     Ok(())
 }
 
-pub fn calculate_aggregated_memory(memory_info: &mut MemoryInfo) -> () {
-    // Simple ML detection based on binary size and function count
-    memory_info.is_ml_workload = memory_info.binary_size_bytes > 200_000 || 
-    memory_info.total_function_references > 150;
+pub fn calculate_aggregated_memory(memory_info: &mut MemoryInfoEstimator) -> () {
+    // Enhanced memory calculation using stack pointer and linear memory
+    // Base memory = linear memory + stack space
+    let base_memory = memory_info.linear_memory_bytes + memory_info.stack_pointer_offset;
+    
+    // Add binary overhead (typically 10-20% of binary size for runtime overhead)
+    let binary_overhead = (memory_info.binary_size_bytes as f64 * 0.15) as u64;
+    
+    // Calculate minimum memory requirement
+    memory_info.estimated_minimum_memory_bytes = base_memory + binary_overhead;
 
-    // Calculate estimates 
-    memory_info.estimated_minimum_memory_bytes = 
-memory_info.binary_size_bytes +           // Static binary footprint
-    memory_info.linear_memory_bytes +         // Data memory
-    memory_info.stack_pointer_offset;         // Stack space
-
+    // Dynamic buffer calculation based on workload complexity
     let buffer_size = if memory_info.is_ml_workload {
-    5 * 1024 * 1024 // 5MB buffer for ML workloads
+        // ML inference workloads (SqueezeNet, ResNet) - large buffer for model operations
+        if memory_info.binary_size_bytes > 500_000 {
+            15 * 1024 * 1024 // 15MB for large ML models
+        } else {
+            12 * 1024 * 1024 // 12MB for medium ML models
+        }
+    } else if memory_info.is_matrix_workload {
+        // Matrix operations (multiplication, transpose) - medium buffer
+        if memory_info.binary_size_bytes > 200_000 {
+            8 * 1024 * 1024  // 8MB for large matrix operations
+        } else {
+            6 * 1024 * 1024  // 6MB for medium matrix operations
+        }
+    } else if memory_info.is_simple_workload {
+        // Simple computational workloads (Fibonacci) - small buffer
+        if memory_info.total_function_references > 50 {
+            3 * 1024 * 1024  // 3MB for complex simple workloads
+        } else {
+            2 * 1024 * 1024  // 2MB for basic simple workloads
+        }
     } else {
-    1024 * 1024 // 1MB buffer for regular workloads
+        // Fallback for unclassified workloads
+        5 * 1024 * 1024      // 5MB default buffer
     };
 
     memory_info.estimated_peak_memory_bytes = memory_info.estimated_minimum_memory_bytes + buffer_size;
+    
+    println!("🧮 Memory Calculation:");
+    println!("   • Base memory: {:.2} MB (linear: {:.2} MB + stack: {:.2} MB)", 
+             base_memory as f64 / (1024.0 * 1024.0),
+             memory_info.linear_memory_bytes as f64 / (1024.0 * 1024.0),
+             memory_info.stack_pointer_offset as f64 / (1024.0 * 1024.0));
+    println!("   • Binary overhead: {:.2} MB", binary_overhead as f64 / (1024.0 * 1024.0));
+    println!("   • Buffer size: {:.2} MB", buffer_size as f64 / (1024.0 * 1024.0));
 }
 
 
-pub fn build_memory_info(wasm_file: &str, wat_file: &str) -> MemoryInfo {
-    let mut memory_info = MemoryInfo::new();
+pub fn build_memory_info(wasm_file: &str, wat_file: &str) -> MemoryInfoEstimator {
+    let mut memory_info = MemoryInfoEstimator::new();
     
     // Analyze binary size first (fast and informative)
     match analyze_binary_size(wasm_file, &mut memory_info) {
@@ -176,7 +269,7 @@ pub fn build_memory_info(wasm_file: &str, wat_file: &str) -> MemoryInfo {
 }
 
 /// Print simplified memory analysis
-pub fn print_memory_analysis_simple(memory_info: &MemoryInfo) {
+pub fn print_memory_analysis_simple(memory_info: &MemoryInfoEstimator) {
     println!("📊 Linear Memory:");
     println!("   • Pages: {} (64KB each)", memory_info.linear_memory_pages);
     println!("   • Total: {:.2} MB", memory_info.linear_memory_bytes as f64 / (1024.0 * 1024.0));
