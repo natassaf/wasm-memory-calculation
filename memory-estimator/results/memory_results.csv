@@ -1,0 +1,8 @@
+uuid, binary_name, input_length, estimated, actual_memory, estimated_memory
+0,/home/pi/memory-estimator/models/image_classification_resnet_onnx_batch.wasm, 0.2259979248046875,154.3744478225708
+1,/home/pi/memory-estimator/models/image_classification_squeezenet_onnx_batch.wasm, 0.1282196044921875,34.79935550689697
+2,/home/pi/memory-estimator/models/matrix_multiplication_component.wasm, 0.0307159423828125,8.329328536987305
+3,/home/pi/memory-estimator/models/image_classification_squeezenet_onnx_batch.wasm, 0.127777099609375,34.79935550689697
+4,/home/pi/memory-estimator/models/matrix_transpose.wasm, 0.0308380126953125,8.3130464553833
+5,/home/pi/memory-estimator/models/fibonacci.wasm, 0.0306854248046875,8.2295560836792
+6,/home/pi/memory-estimator/models/fibonacci_optimized.wasm, 0.0318450927734375,8.298810005187988

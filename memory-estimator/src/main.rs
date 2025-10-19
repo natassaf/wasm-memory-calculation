@@ -1,16 +1,57 @@
 
-use std::env;
+use std::{env, fs};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
-use memory_estimator::memory_info_estimator::{build_memory_info, convert_wasm_to_wat, print_memory_analysis_simple, MemoryInfoEstimator};
-use memory_estimator::wasm_loaders::run_wasm_job_component;
+use memory_estimator::memory_info_estimator::{build_memory_info, convert_wasm_to_wat, print_memory_analysis_simple, MemoryInfoEstimator, detect_ml_task_from_wat};
+use memory_estimator::various::append_data_to_file;
+use memory_estimator::wasm_loader_basic::run_wasm_job_component_basic;
+use memory_estimator::wasm_loader_wasi_nn::run_wasm_job_component_with_wasi_nn;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use base64::{Engine as _, engine::general_purpose};
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 
+static WASM_MODULES_FOLDER: &str = if cfg!(target_os = "linux") {
+    "/home/pi/memory-estimator/wasm-modules/"
+} else {
+    "/Users/athanasiapharmake/workspace/wasm-memory-calculation/memory-estimator/wasm-modules/"
+};
 
+static WASM_MODELS_FOLDER: &str = if cfg!(target_os = "linux") {
+    "/home/pi/memory-estimator/models/"
+} else {
+    "/Users/athanasiapharmake/workspace/wasm-memory-calculation/memory-estimator/models/"
+};
 
+static RESULTS_FOLDER: &str = if cfg!(target_os = "linux") {
+    "/home/pi/memory-estimator/results/"
+} else {
+    "/Users/athanasiapharmake/workspace/wasm-memory-calculation/memory-estimator/results/"
+};
+
+fn get_peak_memory_usage() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let pid = std::process::id() as usize;
+        // let status_content = std::fs::read_to_string(format!("/proc/{}/status", pid));
+        // println!("Status content: {:?}", status_content);
+        // let status_content_2 = std::fs::read_to_string(format!("/proc/{}/statm", pid));
+        // println!("Status content 2: {:?}", status_content_2);
+
+        let content = fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+        for line in content.lines() {
+            if line.starts_with("VmHWM:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    return parts[1].parse::<u64>().ok();
+                }
+            }
+        }
+       return  None;
+    }
+    
+    None
+}
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WasmJobRequest{
     binary_name: String,
@@ -30,28 +71,16 @@ fn spawn_child_process(task: WasmJobRequest) {
     let task_file = format!("/tmp/wasm_task_{}.json", task.task_id);
     let task_json = serde_json::to_string(&task).unwrap();
     std::fs::write(&task_file, task_json).expect("Failed to write task");
-    
-    let mut child = Command::new(std::env::current_exe().unwrap())
+    let current_exe = env::current_exe().unwrap();
+    println!("Current exe: {:?}", current_exe);
+    let mut child = Command::new(current_exe)
         .arg("child")
         .arg(&task_file) // Only pass the task file path
-        .env("OMP_NUM_THREADS", "1")
-        .env("MKL_NUM_THREADS", "1")
-        .env("NUMEXPR_NUM_THREADS", "1")
-        .env("OPENBLAS_NUM_THREADS", "1")
-        .env("BLIS_NUM_THREADS", "1")
-        .env("VECLIB_MAXIMUM_THREADS", "1")
-        .env("NUMBA_NUM_THREADS", "1")
-        .env("ORT_DISABLE_PARALLELISM", "1")
-        .env("ORT_NUM_THREADS", "1")
-        .env("ORT_EXECUTION_PROVIDER", "CPUExecutionProvider")
-        .env("MKL_DYNAMIC", "FALSE")
-        .env("OMP_DYNAMIC", "FALSE")
-        .env("OPENBLAS_DYNAMIC", "FALSE")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("Failed to spawn child");
-    
+
     let output = child.wait_with_output().expect("Failed to wait for child");
     
     // Clean up temp file
@@ -65,8 +94,9 @@ fn spawn_child_process(task: WasmJobRequest) {
     }
 }
 
-async fn run_child(task: WasmJobRequest) {
+async fn run_child(task: WasmJobRequest)->Option<u64> {
     println!("Child: running wasm job component...");
+    
 
     // Handle compressed payload
     let payload = if task.payload_compressed {
@@ -80,41 +110,57 @@ async fn run_child(task: WasmJobRequest) {
         // Payload is already uncompressed
         task.payload
     };
-
-    // Run WASM component with error handling
-    match run_wasm_job_component(
-        task.task_id,
-        "wasm-modules/".to_string() + &task.binary_name,
-        task.func_name,
-        payload,
-        task.model_folder_name,
-    ).await {
-        Ok(result) => println!("Child result: {:?}", result),
-        Err(e) => println!("Child error: {:?}", e),
+    let component_path = WASM_MODULES_FOLDER.to_string() + &task.binary_name;
+    let wat_file_path = WASM_MODULES_FOLDER.to_string() + &task.wat_file;
+    println!("Component path: {}", component_path);
+    
+    // Get memory before WASM execution
+    let memory_before_wasm = get_peak_memory_usage();
+    if let Some(m) = memory_before_wasm {
+        println!("Child: Memory before WASM execution: {} KB", m / 1024);
     }
-
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(statm_content) = std::fs::read_to_string("/proc/self/statm") {
-            let parts: Vec<&str> = statm_content.trim().split_whitespace().collect();
-            if parts.len() >= 2 {
-                let rss_pages: u64 = parts[1].parse().unwrap_or(0);
-                let rss_kb = rss_pages * 4; // Each page is 4KB on Linux
-                println!("Child: /proc/self/statm RSS = {} KB ({} pages)", rss_kb, rss_pages);
-            }
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(status_content) = std::fs::read_to_string("/proc/self/status") {
-            for line in status_content.lines() {
-                if line.starts_with("VmRSS:") || line.starts_with("VmSize:") || line.starts_with("VmPeak:") {
-                    println!("Child: {}", line.trim());
+    match detect_ml_task_from_wat(&wat_file_path) {
+        Ok(is_ml_task) => {
+            if is_ml_task {
+                let folder_to_mount: String = WASM_MODELS_FOLDER.to_string();
+                println!("Child: is_ml_task: {}", is_ml_task);
+                match run_wasm_job_component_with_wasi_nn(
+                    task.task_id,
+                    component_path,
+                    task.func_name,
+                    payload,
+                    folder_to_mount,
+                ).await {
+                    Ok(result) => println!("Child result: {:?}", result),
+                    Err(e) => println!("Child error: {:?}", e),
+                }
+            
+            } else {
+                match run_wasm_job_component_basic(
+                    task.task_id,
+                    component_path,
+                    task.func_name,
+                    payload,
+                    task.model_folder_name,
+                ).await {
+                    Ok(result) => println!("Child result: {:?}", result),
+                    Err(e) => println!("Child error: {:?}", e),
                 }
             }
+    },
+        Err(e) => println!("Child error: {:?}", e),
+    }
+    let mut peak_memory_monitored: Option<u64>= get_peak_memory_usage();
+
+    match (peak_memory_monitored, memory_before_wasm){
+        (Some(memory_after), Some(memory_before)) => {
+            println!("Child: Memory after WASM execution: {} KB", memory_after / 1024);        }
+        (_, _) => {
+            println!("Child: Memory after WASM execution: Not available");
         }
     }
 
+    return peak_memory_monitored;
 }
 
 async fn run_task(task: WasmJobRequest){
@@ -137,21 +183,6 @@ async fn handle_plot_memory()->impl Responder{
 
 #[actix_web::main]
 async fn main() {
-    // Set environment variables BEFORE any WASM execution to force single-threaded behavior
-    std::env::set_var("OMP_NUM_THREADS", "1");
-    std::env::set_var("MKL_NUM_THREADS", "1");
-    std::env::set_var("NUMEXPR_NUM_THREADS", "1");
-    std::env::set_var("OPENBLAS_NUM_THREADS", "1");
-    std::env::set_var("BLIS_NUM_THREADS", "1");
-    std::env::set_var("VECLIB_MAXIMUM_THREADS", "1");
-    std::env::set_var("NUMBA_NUM_THREADS", "1");
-    std::env::set_var("ORT_DISABLE_PARALLELISM", "1");
-    std::env::set_var("ORT_NUM_THREADS", "1");
-    std::env::set_var("ORT_EXECUTION_PROVIDER", "CPUExecutionProvider");
-    std::env::set_var("MKL_DYNAMIC", "FALSE");
-    std::env::set_var("OMP_DYNAMIC", "FALSE");
-    std::env::set_var("OPENBLAS_DYNAMIC", "FALSE");
-    
     let args: Vec<String> = env::args().collect();
     // If this is a child process, run the WASM task and exit
     if args.len() > 1 && args[1] == "child" {
@@ -162,9 +193,10 @@ async fn main() {
             let task: WasmJobRequest = serde_json::from_str(&task_json).expect("Failed to parse task JSON");
             
             // Construct full file paths
-            let cwasm_file: String = "wasm-modules/".to_string() + &task.cwasm_file;
-            let wat_file: String = "wasm-modules/".to_string() + &task.wat_file;
-            let wasm_file: String = "wasm-modules/".to_string() + &task.binary_name;
+            let cwasm_file: String = WASM_MODULES_FOLDER.to_string() + &task.cwasm_file;
+            let wat_file: String = WASM_MODULES_FOLDER.to_string() + &task.wat_file;
+            let wasm_file: String =WASM_MODELS_FOLDER.to_string() + &task.binary_name;
+            
             // Convert WASM to WAT only if .wat file doesn't exist
             if !std::path::Path::new(&wat_file).exists() {
                 match convert_wasm_to_wat(&wasm_file, &wat_file) {
@@ -173,15 +205,46 @@ async fn main() {
                 }
             }
 
-            let memory_info: MemoryInfoEstimator = build_memory_info(&cwasm_file, &wat_file);
-            println!("Estimated memory info: {}", memory_info);
-            print_memory_analysis_simple(&memory_info);
+            // Use payload content directly for memory analysis (it's already the content, not a file path)
+            let payload = if task.payload_compressed {
+                // Decompress the payload for analysis
+                let compressed_bytes = base64::engine::general_purpose::STANDARD.decode(&task.payload).expect("Failed to decode base64");
+                let mut decoder = flate2::read::GzDecoder::new(&compressed_bytes[..]);
+                let mut decompressed = String::new();
+                std::io::Read::read_to_string(&mut decoder, &mut decompressed).expect("Failed to decompress");
+                decompressed
+            } else {
+                task.payload.clone()
+            };
+
+            let memory_info: MemoryInfoEstimator = build_memory_info(&cwasm_file, &wat_file, &payload, &task.model_folder_name);
+            // println!("Estimated memory info: {}", memory_info);
+            // print_memory_analysis_simple(&memory_info);
+
+            let peak_memory_monitored = run_child(task.clone()).await;
             
-            run_child(task).await;
+            println!("Peak memory estimated: {} MB", memory_info.estimated_peak_memory_bytes as f64 / (1024.0 * 1024.0));
+            if let Some(peak_memory_monitored) = peak_memory_monitored {
+                let peak_memory_monitored = peak_memory_monitored as f64 / (1024.0 * 1024.0);
+                println!("Peak memory monitored: {} MB", peak_memory_monitored);
+            } else {
+                println!("Peak memory monitored: Not available");
+            }
+            let peak_memory_estimated = memory_info.estimated_peak_memory_bytes as f64 / (1024.0 * 1024.0);
+            match peak_memory_monitored {
+                Some(peak_memory_monitored) => {
+                    let peak_memory_monitored = peak_memory_monitored as f64 / (1024.0 * 1024.0);
+                    let data = format!("{},{}, {},{}", &task.task_id.to_string(), &wasm_file, &peak_memory_monitored.to_string(), &peak_memory_estimated.to_string());
+                    append_data_to_file(&data, &(RESULTS_FOLDER.to_string()+"memory_results.csv")).unwrap();
+                }
+                None => {
+                    println!("Peak memory monitored: Not available");
+                }
+            }
         } else {
             println!("Error: Not enough arguments for child process");
         }
-        return; // Exit child process - don't start HTTP server
+        return;
     }
     // Only start HTTP server if this is the parent process
     println!("🚀 HTTP Server starting on http://[::]:8082");

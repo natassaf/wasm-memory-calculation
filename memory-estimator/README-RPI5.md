@@ -41,11 +41,6 @@ sudo apt-get install -y gcc-aarch64-linux-gnu
 
 ## Memory Measurement Notes
 
-### macOS Memory Measurement Issues
-The memory measurement on macOS may be inaccurate due to:
-- Different memory reporting mechanisms
-- System-level memory management
-- Process isolation differences
 
 ### Raspberry Pi 5 Advantages
 - More accurate memory measurement using Linux `/proc/self/statm`
