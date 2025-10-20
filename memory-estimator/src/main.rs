@@ -3,6 +3,9 @@ use std::{env, fs};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use memory_estimator::memory_info_estimator::{build_memory_info, convert_wasm_to_wat, print_memory_analysis_simple, MemoryInfoEstimator, detect_ml_task_from_wat};
+use memory_estimator::memory_info_estimator_advanced::{build_memory_info_advanced, MemoryInfoEstimatorAdvanced};
+use memory_estimator::memory_info_estimator_conservative::{build_memory_info_conservative, MemoryInfoEstimatorConservative};
+use memory_estimator::memory_info_estimator_improved::{build_memory_info_improved, MemoryInfoEstimatorImproved};
 use memory_estimator::various::append_data_to_file;
 use memory_estimator::wasm_loader_basic::run_wasm_job_component_basic;
 use memory_estimator::wasm_loader_wasi_nn::run_wasm_job_component_with_wasi_nn;
@@ -117,7 +120,7 @@ async fn run_child(task: WasmJobRequest)->Option<u64> {
     // Get memory before WASM execution
     let memory_before_wasm = get_peak_memory_usage();
     if let Some(m) = memory_before_wasm {
-        println!("Child: Memory before WASM execution: {} KB", m / 1024);
+        println!("Child: Memory before WASM execution: {} mb", m / 1024);
     }
     match detect_ml_task_from_wat(&wat_file_path) {
         Ok(is_ml_task) => {
@@ -150,17 +153,17 @@ async fn run_child(task: WasmJobRequest)->Option<u64> {
     },
         Err(e) => println!("Child error: {:?}", e),
     }
-    let mut peak_memory_monitored: Option<u64>= get_peak_memory_usage();
+    let mut peak_memory_monitored_kb: Option<u64>= get_peak_memory_usage();
 
-    match (peak_memory_monitored, memory_before_wasm){
+    match (peak_memory_monitored_kb, memory_before_wasm){
         (Some(memory_after), Some(memory_before)) => {
-            println!("Child: Memory after WASM execution: {} KB", memory_after / 1024);        }
+            println!("Child: Memory after WASM execution: {} MB", memory_after / 1024);        }
         (_, _) => {
             println!("Child: Memory after WASM execution: Not available");
         }
     }
 
-    return peak_memory_monitored;
+    return peak_memory_monitored_kb;
 }
 
 async fn run_task(task: WasmJobRequest){
@@ -217,24 +220,23 @@ async fn main() {
                 task.payload.clone()
             };
 
-            let memory_info: MemoryInfoEstimator = build_memory_info(&cwasm_file, &wat_file, &payload, &task.model_folder_name);
+            let memory_info: MemoryInfoEstimatorConservative = build_memory_info_conservative(&cwasm_file, &wat_file, &payload, &task.model_folder_name);
             // println!("Estimated memory info: {}", memory_info);
             // print_memory_analysis_simple(&memory_info);
 
-            let peak_memory_monitored = run_child(task.clone()).await;
+            let peak_memory_monitored_kb = run_child(task.clone()).await;
             
-            println!("Peak memory estimated: {} MB", memory_info.estimated_peak_memory_bytes as f64 / (1024.0 * 1024.0));
-            if let Some(peak_memory_monitored) = peak_memory_monitored {
-                let peak_memory_monitored = peak_memory_monitored as f64 / (1024.0 * 1024.0);
+            if let Some(peak_memory_monitored) = peak_memory_monitored_kb {
+                let peak_memory_monitored = peak_memory_monitored as f64 /  1024.0;
                 println!("Peak memory monitored: {} MB", peak_memory_monitored);
             } else {
                 println!("Peak memory monitored: Not available");
             }
             let peak_memory_estimated = memory_info.estimated_peak_memory_bytes as f64 / (1024.0 * 1024.0);
-            match peak_memory_monitored {
-                Some(peak_memory_monitored) => {
-                    let peak_memory_monitored = peak_memory_monitored as f64 / (1024.0 * 1024.0);
-                    let data = format!("{},{}, {},{}", &task.task_id.to_string(), &wasm_file, &peak_memory_monitored.to_string(), &peak_memory_estimated.to_string());
+            match peak_memory_monitored_kb {
+                Some(peak_memory_monitored_kb) => {
+                    let peak_memory_monitored_mb = peak_memory_monitored_kb as f64 / 1024.0;
+                    let data = format!("{},{}, {},{}", &task.task_id.to_string(), &wasm_file, &peak_memory_monitored_mb.to_string(), &peak_memory_estimated.to_string());
                     append_data_to_file(&data, &(RESULTS_FOLDER.to_string()+"memory_results.csv")).unwrap();
                 }
                 None => {
