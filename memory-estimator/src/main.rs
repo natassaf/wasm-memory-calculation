@@ -6,6 +6,7 @@ use memory_estimator::memory_info_estimator::{build_memory_info, convert_wasm_to
 use memory_estimator::memory_info_estimator_advanced::{build_memory_info_advanced, MemoryInfoEstimatorAdvanced};
 use memory_estimator::memory_info_estimator_conservative::{build_memory_info_conservative, MemoryInfoEstimatorConservative};
 use memory_estimator::memory_info_estimator_improved::{build_memory_info_improved, MemoryInfoEstimatorImproved};
+use memory_estimator::features_extractor::{extract_features, append_features_to_csv};
 use memory_estimator::various::append_data_to_file;
 use memory_estimator::wasm_loader_basic::run_wasm_job_component_basic;
 use memory_estimator::wasm_loader_wasi_nn::run_wasm_job_component_with_wasi_nn;
@@ -61,7 +62,7 @@ pub struct WasmJobRequest{
     func_name: String,
     payload: String,
     payload_compressed: bool,
-    task_id: usize,
+    task_id: String,
     model_folder_name: String,
     cwasm_file: String,
     wat_file: String,
@@ -221,6 +222,7 @@ async fn main() {
             };
 
             let memory_info: MemoryInfoEstimatorConservative = build_memory_info_conservative(&cwasm_file, &wat_file, &payload, &task.model_folder_name);
+
             // println!("Estimated memory info: {}", memory_info);
             // print_memory_analysis_simple(&memory_info);
 
@@ -232,6 +234,15 @@ async fn main() {
             } else {
                 println!("Peak memory monitored: Not available");
             }
+
+            // Extract features and store row for ML training
+            println!("Extracting features");
+            let features = extract_features(&cwasm_file, &wat_file, &payload, &task.model_folder_name, peak_memory_monitored_kb);
+            let csv_path = RESULTS_FOLDER.to_string() + "memory_data.csv";
+            if let Err(e) = append_features_to_csv(&csv_path, &features) {
+                eprintln!("Failed to append features to CSV: {}", e);
+            }
+
             let peak_memory_estimated = memory_info.estimated_peak_memory_bytes as f64 / (1024.0 * 1024.0);
             match peak_memory_monitored_kb {
                 Some(peak_memory_monitored_kb) => {

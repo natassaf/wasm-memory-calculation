@@ -133,7 +133,7 @@ impl WasmComponentLoaderWasiNn{
     }
 }
 
-pub async fn run_wasm_job_component_with_wasi_nn(task_id: usize, component_name:String, func_name:String, payload:String, folder_to_mount:String)->Result<Vec<Val>, Error>{
+pub async fn run_wasm_job_component_with_wasi_nn(task_id: String, component_name:String, func_name:String, payload:String, folder_to_mount:String)->Result<Vec<Val>, Error>{
     // Set up Wasmtime engine and module outside blocking
     // let component_name ="math_tasks".to_string();
     let mut shared_wasm_loader = WasmComponentLoaderWasiNn::new(folder_to_mount);
