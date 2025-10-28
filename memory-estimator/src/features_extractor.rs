@@ -5,6 +5,9 @@ use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct MemoryFeatures {
+    // Binary identification
+    pub binary_name: String,
+    
     // Size analysis
     pub binary_size_bytes: u64,
     pub data_section_size_bytes: u64,
@@ -33,17 +36,20 @@ pub struct MemoryFeatures {
     pub is_ml_workload: bool,
     pub request_payload_size: u64,
     pub model_file_size: u64,
-    pub memory_kb: i64
+    pub memory_kb: i64,
+    pub payload: i64,
+    task_duration: f64
 }
 
 impl MemoryFeatures {
     pub fn csv_header() -> &'static str {
-        "binary_size_bytes,data_section_size_bytes,import_count,export_count,function_count,global_variable_count,type_definition_count,instance_count,resource_count,total_local_variables,max_local_variables_per_function,avg_local_variables_per_function,high_complexity_functions,linear_memory_bytes,stack_pointer_offset,total_function_references,is_ml_workload,request_payload_size,model_file_size, memory_kb"
+        "binary_name,binary_size_bytes,data_section_size_bytes,import_count,export_count,function_count,global_variable_count,type_definition_count,instance_count,resource_count,total_local_variables,max_local_variables_per_function,avg_local_variables_per_function,high_complexity_functions,linear_memory_bytes,stack_pointer_offset,total_function_references,is_ml_workload,request_payload_size,model_file_size,payload,memory_kb, task_duration_sec"
     }
 
     pub fn to_csv_row(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{},{},{},{:.4},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{:.4},{},{},{},{},{},{},{},{},{},{}",
+            self.binary_name,
             self.binary_size_bytes,
             self.data_section_size_bytes,
             self.import_count,
@@ -54,6 +60,7 @@ impl MemoryFeatures {
             self.instance_count,
             self.resource_count,
             self.total_local_variables,
+            self.max_local_variables_per_function,
             self.avg_local_variables_per_function,
             self.high_complexity_functions,
             self.linear_memory_bytes,
@@ -62,7 +69,9 @@ impl MemoryFeatures {
             if self.is_ml_workload { 1 } else { 0 },
             self.request_payload_size,
             self.model_file_size,
+            self.payload,
             self.memory_kb,
+            self.task_duration
         )
     }
 }
@@ -73,6 +82,7 @@ pub fn extract_features(
     payload: &str,
     model_folder_name: &str,
     memory_kb: Option<u64>,
+    task_duration: f64
 ) -> MemoryFeatures {
     // Binary size
     let binary_size_bytes = fs::metadata(wasm_file).map(|m| m.len()).unwrap_or(0);
@@ -147,7 +157,30 @@ pub fn extract_features(
     let request_payload_size = payload.len() as u64;
     let model_file_size = compute_model_folder_size(model_folder_name);
 
+    // Parse payload: try to extract n from JSON, fallback to length
+    let payload_value = if let Ok(parsed_data) = serde_json::from_str::<serde_json::Value>(payload) {
+        println!("Parsed data: {:?}", parsed_data);
+        if let Some(n_value) = parsed_data.get("n") {
+            if let Some(n) = n_value.as_f64() {
+                println!("Using n value from JSON: {}", n);
+                n as i64
+            } else {
+                println!("n field exists but not a number, using payload length: {}", payload.len());
+                payload.len() as i64
+            }
+        } else {
+            println!("No n field in JSON, using payload length: {}", payload.len());
+            payload.len() as i64
+        }
+    } else {
+        println!("Failed to parse JSON, using payload length: {}", payload.len());
+        payload.len() as i64
+    };
+    // Extract binary name from the file path
+    let binary_name = wasm_file;
+
     MemoryFeatures {
+        binary_name: binary_name.to_string(),
         binary_size_bytes,
         data_section_size_bytes,
         import_count,
@@ -167,7 +200,10 @@ pub fn extract_features(
         is_ml_workload,
         request_payload_size,
         model_file_size,
+        payload: payload_value,
         memory_kb: memory_kb.map(|kb| kb as i64).unwrap_or(-1),
+        task_duration: task_duration
+
     }
 }
 

@@ -36,6 +36,12 @@ export ORT_STRATEGY=system
 # Also add it to the library path
 export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
 
+# Create folder memory-estimator
+mkdir memory-estimator
+
+# Copy the code from host to pi
+scp -r . pi@192.168.8.110:/home/pi/memory-estimator
+
 # Navigate to your project
 cd /path/to/memory-estimator
 

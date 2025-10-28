@@ -1,11 +1,12 @@
 
 use std::{env, fs};
-use std::io::{Read, Write};
 use std::process::{Command, Stdio};
-use memory_estimator::memory_info_estimator::{build_memory_info, convert_wasm_to_wat, print_memory_analysis_simple, MemoryInfoEstimator, detect_ml_task_from_wat};
-use memory_estimator::memory_info_estimator_advanced::{build_memory_info_advanced, MemoryInfoEstimatorAdvanced};
+use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use std::thread;
+use std::time::Duration;
+use memory_estimator::memory_info_estimator::{convert_wasm_to_wat, detect_ml_task_from_wat};
 use memory_estimator::memory_info_estimator_conservative::{build_memory_info_conservative, MemoryInfoEstimatorConservative};
-use memory_estimator::memory_info_estimator_improved::{build_memory_info_improved, MemoryInfoEstimatorImproved};
 use memory_estimator::features_extractor::{extract_features, append_features_to_csv};
 use memory_estimator::various::append_data_to_file;
 use memory_estimator::wasm_loader_basic::run_wasm_job_component_basic;
@@ -14,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use base64::{Engine as _, engine::general_purpose};
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use tokio::task;
+use core_affinity;
 
 static WASM_MODULES_FOLDER: &str = if cfg!(target_os = "linux") {
     "/home/pi/memory-estimator/wasm-modules/"
@@ -32,6 +35,71 @@ static RESULTS_FOLDER: &str = if cfg!(target_os = "linux") {
 } else {
     "/Users/athanasiapharmake/workspace/wasm-memory-calculation/memory-estimator/results/"
 };
+
+// Queue system for handling requests sequentially
+#[derive(Debug, Clone)]
+pub struct QueuedRequest {
+    task: WasmJobRequest,
+    timestamp: std::time::SystemTime,
+}
+
+#[derive(Debug)]
+pub struct RequestQueue {
+    queue: VecDeque<QueuedRequest>,
+    processing: bool,
+    total_processed: u64,
+    total_failed: u64,
+}
+
+impl RequestQueue {
+    pub fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            processing: false,
+            total_processed: 0,
+            total_failed: 0,
+        }
+    }
+
+    pub fn add_request(&mut self, task: WasmJobRequest) {
+        let queued_request = QueuedRequest {
+            task,
+            timestamp: std::time::SystemTime::now(),
+        };
+        self.queue.push_back(queued_request);
+        println!("📥 Request added to queue. Queue size: {}", self.queue.len());
+    }
+
+    pub fn get_next_request(&mut self) -> Option<QueuedRequest> {
+        self.queue.pop_front()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn mark_processing(&mut self, processing: bool) {
+        self.processing = processing;
+    }
+
+    pub fn increment_processed(&mut self) {
+        self.total_processed += 1;
+    }
+
+    pub fn increment_failed(&mut self) {
+        self.total_failed += 1;
+    }
+
+    pub fn get_stats(&self) -> (usize, bool, u64, u64) {
+        (self.queue.len(), self.processing, self.total_processed, self.total_failed)
+    }
+}
+
+type SharedQueue = Arc<Mutex<RequestQueue>>;
 
 fn get_peak_memory_usage() -> Option<u64> {
     #[cfg(target_os = "linux")]
@@ -77,7 +145,7 @@ fn spawn_child_process(task: WasmJobRequest) {
     std::fs::write(&task_file, task_json).expect("Failed to write task");
     let current_exe = env::current_exe().unwrap();
     println!("Current exe: {:?}", current_exe);
-    let mut child = Command::new(current_exe)
+    let child = Command::new(current_exe)
         .arg("child")
         .arg(&task_file) // Only pass the task file path
         .stdout(Stdio::piped())
@@ -91,16 +159,26 @@ fn spawn_child_process(task: WasmJobRequest) {
     let _ = std::fs::remove_file(&task_file);
     
     if output.status.success() {
-        println!("Child output: {}", String::from_utf8_lossy(&output.stdout));
+        println!("Child returned successfully");
     } else {
         println!("Child error: {}", String::from_utf8_lossy(&output.stderr));
         println!("Child stdout: {}", String::from_utf8_lossy(&output.stdout));
     }
 }
 
-async fn run_child(task: WasmJobRequest)->Option<u64> {
+async fn run_child(task: WasmJobRequest)->(Option<u64>, f64) {
     println!("Child: running wasm job component...");
     
+    // Pin the current thread to core 0
+    if let Some(cores) = core_affinity::get_core_ids() {
+        if let Some(&core_id) = cores.first() {
+            if core_affinity::set_for_current(core_id) {
+                println!("Pinned thread to core {}", core_id.id);
+            } else {
+                println!("Failed to pin thread to core {}", core_id.id);
+            }
+        }
+    }
 
     // Handle compressed payload
     let payload = if task.payload_compressed {
@@ -114,6 +192,7 @@ async fn run_child(task: WasmJobRequest)->Option<u64> {
         // Payload is already uncompressed
         task.payload
     };
+    // println!("Payload: {}", payload);
     let component_path = WASM_MODULES_FOLDER.to_string() + &task.binary_name;
     let wat_file_path = WASM_MODULES_FOLDER.to_string() + &task.wat_file;
     println!("Component path: {}", component_path);
@@ -123,7 +202,9 @@ async fn run_child(task: WasmJobRequest)->Option<u64> {
     if let Some(m) = memory_before_wasm {
         println!("Child: Memory before WASM execution: {} mb", m / 1024);
     }
-    match detect_ml_task_from_wat(&wat_file_path) {
+    let is_ml = detect_ml_task_from_wat(&wat_file_path);
+    let start_time = std::time::Instant::now();
+    match is_ml {
         Ok(is_ml_task) => {
             if is_ml_task {
                 let folder_to_mount: String = WASM_MODELS_FOLDER.to_string();
@@ -154,17 +235,19 @@ async fn run_child(task: WasmJobRequest)->Option<u64> {
     },
         Err(e) => println!("Child error: {:?}", e),
     }
-    let mut peak_memory_monitored_kb: Option<u64>= get_peak_memory_usage();
+    let duration: f64 = start_time.elapsed().as_secs_f64();
+    println!("Child: WASM execution time: {:?}", duration);
+    let peak_memory_monitored_kb: Option<u64>= get_peak_memory_usage();
 
     match (peak_memory_monitored_kb, memory_before_wasm){
-        (Some(memory_after), Some(memory_before)) => {
+        (Some(memory_after), Some(_memory_before)) => {
             println!("Child: Memory after WASM execution: {} MB", memory_after / 1024);        }
         (_, _) => {
             println!("Child: Memory after WASM execution: Not available");
         }
     }
 
-    return peak_memory_monitored_kb;
+    return (peak_memory_monitored_kb, duration);
 }
 
 async fn run_task(task: WasmJobRequest){
@@ -176,13 +259,80 @@ async fn run_task(task: WasmJobRequest){
     }
 
 }
-async fn handle_submit_task(task: web::Json<WasmJobRequest>)->impl Responder{
-    run_task(task.into_inner()).await;
-    HttpResponse::Ok().body("Task done")
+async fn handle_submit_task(task: web::Json<WasmJobRequest>, queue: web::Data<SharedQueue>) -> impl Responder {
+    let mut queue_guard = queue.lock().unwrap();
+    queue_guard.add_request(task.into_inner());
+    let queue_size = queue_guard.len();
+    drop(queue_guard); // Release the lock
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "queued",
+        "message": "Task added to queue",
+        "queue_size": queue_size
+    }))
 }
 
 async fn handle_plot_memory()->impl Responder{
     HttpResponse::Ok().body("Plots ok")
+}
+
+async fn handle_queue_status(queue: web::Data<SharedQueue>) -> impl Responder {
+    let queue_guard = queue.lock().unwrap();
+    let (queue_size, processing, total_processed, total_failed) = queue_guard.get_stats();
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "queue_size": queue_size,
+        "processing": processing,
+        "total_processed": total_processed,
+        "total_failed": total_failed,
+        "status": if processing { "processing" } else if queue_size > 0 { "waiting" } else { "idle" }
+    }))
+}
+
+// Background worker function that processes the queue sequentially
+fn process_queue_worker(queue: SharedQueue) {
+    println!("🔄 Queue worker started");
+    
+    loop {
+        // Check for next request
+        let next_request = {
+            let mut queue_guard = queue.lock().unwrap();
+            if !queue_guard.is_empty() {
+                queue_guard.mark_processing(true);
+                let request = queue_guard.get_next_request();
+                if let Some(ref req) = request {
+                    println!("🔄 Processing task: {}", req.task.task_id);
+                }
+                request
+            } else {
+                queue_guard.mark_processing(false);
+                None
+            }
+        };
+
+        if let Some(queued_request) = next_request {
+            // Process the task
+            let task = queued_request.task;
+            println!("🚀 Starting task: {}", task.task_id);
+            
+            // Run the task in a blocking way since we're in a separate thread
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                run_task(task).await;
+            });
+            
+            // Update processed count
+            {
+                let mut queue_guard = queue.lock().unwrap();
+                queue_guard.increment_processed();
+                queue_guard.mark_processing(false);
+                println!("✅ Task completed. Total processed: {}", queue_guard.total_processed);
+            }
+        } else {
+            // No tasks in queue, wait a bit
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 #[actix_web::main]
@@ -226,7 +376,7 @@ async fn main() {
             // println!("Estimated memory info: {}", memory_info);
             // print_memory_analysis_simple(&memory_info);
 
-            let peak_memory_monitored_kb = run_child(task.clone()).await;
+            let (peak_memory_monitored_kb, task_duration) = run_child(task.clone()).await;
             
             if let Some(peak_memory_monitored) = peak_memory_monitored_kb {
                 let peak_memory_monitored = peak_memory_monitored as f64 /  1024.0;
@@ -237,7 +387,7 @@ async fn main() {
 
             // Extract features and store row for ML training
             println!("Extracting features");
-            let features = extract_features(&cwasm_file, &wat_file, &payload, &task.model_folder_name, peak_memory_monitored_kb);
+            let features = extract_features(&cwasm_file, &wat_file, &payload, &task.model_folder_name, peak_memory_monitored_kb, task_duration);
             let csv_path = RESULTS_FOLDER.to_string() + "memory_data.csv";
             if let Err(e) = append_features_to_csv(&csv_path, &features) {
                 eprintln!("Failed to append features to CSV: {}", e);
@@ -247,8 +397,8 @@ async fn main() {
             match peak_memory_monitored_kb {
                 Some(peak_memory_monitored_kb) => {
                     let peak_memory_monitored_mb = peak_memory_monitored_kb as f64 / 1024.0;
-                    let data = format!("{},{}, {},{}", &task.task_id.to_string(), &wasm_file, &peak_memory_monitored_mb.to_string(), &peak_memory_estimated.to_string());
-                    append_data_to_file(&data, &(RESULTS_FOLDER.to_string()+"memory_results.csv")).unwrap();
+                    // let data = format!("{}, {}, {}, {}, {}", &task.task_id.to_string(), &wasm_file, &peak_memory_monitored_mb.to_string(), &peak_memory_estimated.to_string(), task_duration.to_string());
+                    // append_data_to_file(&data, &(RESULTS_FOLDER.to_string()+"memory_results.csv")).unwrap();
                 }
                 None => {
                     println!("Peak memory monitored: Not available");
@@ -264,16 +414,40 @@ async fn main() {
     println!("📡 Available endpoints:");
     println!("   POST /submit_task - Submit a WASM task");
     println!("   GET  /plot_memory - Get memory plots");
+    println!("   GET  /queue_status - Get queue status");
 
+    // Create shared queue
+    let queue: SharedQueue = Arc::new(Mutex::new(RequestQueue::new()));
+    
+    // Clone for background worker
+    let worker_queue = queue.clone();
+    
+    // Start background worker in a separate thread
+    let _worker_handle = thread::spawn(move || {
+        process_queue_worker(worker_queue);
+    });
+    
+    // Create HTTP server with queue data
     let server = HttpServer::new(move || {
-        let mut app = App::new() ;
+        let mut app = App::new()
+            .app_data(web::Data::new(queue.clone()));
         app = app.route("/submit_task", web::post().to(handle_submit_task));
         app = app.route("/plot_memory", web::get().to(handle_plot_memory));
+        app = app.route("/queue_status", web::get().to(handle_queue_status));
         app
     })
     .bind("[::]:8082").unwrap()
     .shutdown_timeout(5) // 5 seconds timeout for graceful shutdown
     .run();
 
-    server.await.unwrap();
+    // Start server
+    let server_handle = tokio::spawn(async move {
+        server.await.unwrap();
+    });
+
+    // Wait for server to finish
+    server_handle.await.unwrap();
+    
+    // Note: The worker thread will continue running until the process exits
+    // In a production system, you might want to add graceful shutdown handling
 }
